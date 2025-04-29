@@ -1,0 +1,17 @@
+[project]
+name = "amnet-aime-reader"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "construct==2.10.68",
+    "construct-typing>=0.6.2",
+    "pyserial>=3.5",
+    "starlette>=0.46.2",
+    "structlog>=25.3.0",
+    "uvicorn>=0.34.2",
+]
+
+[tool.basedpyright]
+exclude = [".venv"]
