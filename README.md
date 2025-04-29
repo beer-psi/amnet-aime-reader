@@ -2,7 +2,8 @@
 
 An AMNet-compatible (-ish) AiMe reader emulator.
 
-Requires com2com to map from COM31 to whatever the COM port is for your game.
+Requires com2com to map from COM31 to whatever the COM port is for your game. Also disable
+AiMe reader emulation in tools.
 
 ## Usage
 
