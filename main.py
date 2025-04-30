@@ -11,7 +11,7 @@ from typing import Any, Generic, Literal, Protocol, TypeGuard, TypeVar, TypedDic
 import serial
 import structlog
 import uvicorn
-from construct import Array, Bytes, Struct, Int8ul, Switch, this
+from construct import Array, Bytes, Rebuild, Struct, Int8ul, Switch, len_, this
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
@@ -155,7 +155,7 @@ def is_led_request(
     )
 
 
-CardInfoFormat = Struct(
+CardSelectResponsePayloadFormat = Struct(
     "count" / Int8ul,
     "cards"
     / Array(
@@ -186,31 +186,24 @@ class CardType(IntEnum):
 
 
 AimeReaderResponseFormat = Struct(
-    "length" / Int8ul,
+    "length" / Rebuild(Int8ul, len_(this.payload) + 6),
     "address" / Int8ul,
     "sequence" / Int8ul,
     "command" / Int8ul,
     "status" / Int8ul,
-    "payload_length" / Int8ul,
-    "payload"
-    / Switch(
-        this.command,
-        {
-            AimeReaderCommand.CARD_DETECT.value: CardInfoFormat,
-        },
-        Bytes(this.payload_length),
-    ),
+    "payload_length" / Rebuild(Int8ul, len_(this.payload)),
+    "payload" / Bytes(this.payload_length),
 )
 
 
 class AimeReaderResponseDict(TypedDict):
-    length: int
+    # length: int
     address: int
     sequence: int
     command: int
     status: int
-    payload_length: int
-    payload: bytes | CardSelectResponsePayload
+    # payload_length: int
+    payload: bytes
 
 
 class AimeReader:
@@ -385,7 +378,7 @@ class AimeReader:
         if is_led_request(request):
             logger.debug(
                 "set LED",
-                command=request.command,
+                command=AimeReaderCommand(request.command),
                 r=request.payload.r,
                 g=request.payload.g,
                 b=request.payload.b,
@@ -432,23 +425,25 @@ class AimeReader:
                 self.send_response(
                     request,
                     AimeReaderStatus.OK,
-                    {"count": 0, "cards": []},
+                    CardSelectResponsePayloadFormat.build({"count": 0, "cards": []}),
                 )
                 return
 
             self.send_response(
                 request,
                 AimeReaderStatus.OK,
-                {
-                    "count": 1,
-                    "cards": [
-                        {
-                            "type": CardType.MIFARE.value,
-                            "id_length": 4,
-                            "id": self.card_dump[:4],
-                        }
-                    ],
-                },
+                CardSelectResponsePayloadFormat.build(
+                    {
+                        "count": 1,
+                        "cards": [
+                            {
+                                "type": CardType.MIFARE.value,
+                                "id_length": 4,
+                                "id": self.card_dump[:4],
+                            }
+                        ],
+                    }
+                ),
             )
             return
 
@@ -482,7 +477,9 @@ class AimeReader:
             AimeReaderCommand.EXT_TO_NORMAL_MODE,
             AimeReaderCommand.SEND_BINDATA_INIT,
         ):
-            logger.debug("updater mode stuff", command=request.command)
+            logger.debug(
+                "updater mode stuff", command=AimeReaderCommand(request.command)
+            )
             self.send_response(request, AimeReaderStatus.OK, b"")
             return
 
@@ -507,25 +504,20 @@ class AimeReader:
         self,
         request: AimeReaderRequest[Any],  # pyright: ignore[reportExplicitAny]
         status: AimeReaderStatus,
-        payload: bytes | CardSelectResponsePayload,
+        payload: bytes,
     ):
         response: AimeReaderResponseDict = {
-            "length": len(payload) + 6,
             "address": request.address,
             "sequence": request.sequence,
             "command": request.command,
             "status": status.value,
-            "payload_length": len(payload),
             "payload": payload,
         }
 
-        logger.debug(
-            "sending response",
-            status=status,
-            payload=payload.hex() if isinstance(payload, bytes) else payload,
-        )
+        logger.debug("sending response", status=status, payload=payload.hex())
 
         data = AimeReaderResponseFormat.build(cast(dict[str, Any], response))  # pyright: ignore[reportInvalidCast, reportExplicitAny]
+
         escaped_data = bytearray([0xE0])
         checksum = 0
 
