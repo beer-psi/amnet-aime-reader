@@ -1,3 +1,4 @@
+# pyright: reportAny=false
 import re
 import signal
 import string
@@ -5,19 +6,23 @@ import threading
 import time
 from enum import IntEnum
 from time import sleep
-from typing import Any, Literal, TypedDict, cast
+from typing import Any, Generic, Literal, Protocol, TypeGuard, TypeVar, TypedDict, cast
 
 import serial
 import structlog
 import uvicorn
-from construct import Array, Bytes, Struct, Int8ul, this
+from construct import Array, Bytes, Struct, Int8ul, Switch, this
 from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import BaseRoute, Route
-from starlette.status import HTTP_202_ACCEPTED, HTTP_400_BAD_REQUEST, HTTP_429_TOO_MANY_REQUESTS
+from starlette.status import (
+    HTTP_202_ACCEPTED,
+    HTTP_400_BAD_REQUEST,
+    HTTP_429_TOO_MANY_REQUESTS,
+)
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger()
 
@@ -63,7 +68,7 @@ class AimeReaderStatus(IntEnum):
     NOT_ACCEPT = 0x02
     INVALID_COMMAND = 0x03
     INVALID_DATA = 0x04
-    SUM_ERROR = 0x05
+    CHECKSUM_ERROR = 0x05
     INTERNAL_ERROR = 0x06
     INVALID_FIRM_DATA = 0x07
     FIRM_UPDATE_SUCCESS = 0x08
@@ -71,47 +76,86 @@ class AimeReaderStatus(IntEnum):
     COMP_DUMMY_3RD = 0x20
 
 
-AimeReaderRequest = Struct(
+MifareCardRequest = Struct(
+    "uid" / Bytes(4),
+    "block_no" / Int8ul,
+)
+
+Color = Struct(
+    "r" / Int8ul,
+    "g" / Int8ul,
+    "b" / Int8ul,
+)
+
+AimeReaderRequestFormat = Struct(
     "length" / Int8ul,
     "address" / Int8ul,
     "sequence" / Int8ul,
     "command" / Int8ul,
     "payload_length" / Int8ul,
-    "payload" / Bytes(this.payload_length),
+    "payload"
+    / Switch(
+        this.command,
+        {
+            AimeReaderCommand.CARD_SELECT.value: MifareCardRequest,
+            AimeReaderCommand.MIFARE_AUTHORIZE_A.value: MifareCardRequest,
+            AimeReaderCommand.MIFARE_AUTHORIZE_B.value: MifareCardRequest,
+            AimeReaderCommand.MIFARE_READ.value: MifareCardRequest,
+            AimeReaderCommand.EXT_BOARD_LED_RGB.value: Color,
+            AimeReaderCommand.EXT_BOARD_LED_RGB_UNKNOWN.value: Color,
+        },
+        Bytes(this.payload_length),
+    ),
 )
 
 
-class AimeReaderRequestDict(TypedDict):
+class MifareRequestPayload(Protocol):
+    uid: bytes
+    block_no: int
+
+
+class ColorRequestPayload(Protocol):
+    r: int
+    g: int
+    b: int
+
+
+AimeReaderRequestPayload = bytes | MifareRequestPayload | ColorRequestPayload
+
+
+T = TypeVar("T", bound=AimeReaderRequestPayload, default=bytes)
+
+
+class AimeReaderRequest(Protocol, Generic[T]):
     length: int
     address: int
     sequence: int
     command: int
     payload_length: int
-    payload: bytes
+    payload: T
 
 
-AimeReaderResponse = Struct(
-    "length" / Int8ul,
-    "address" / Int8ul,
-    "sequence" / Int8ul,
-    "command" / Int8ul,
-    "status" / Int8ul,
-    "payload_length" / Int8ul,
-    "payload" / Bytes(this.payload_length),
-)
+def is_mifare_request(
+    request: AimeReaderRequest,
+) -> TypeGuard[AimeReaderRequest[MifareRequestPayload]]:
+    return request.command in (
+        AimeReaderCommand.CARD_SELECT,
+        AimeReaderCommand.MIFARE_AUTHORIZE_A,
+        AimeReaderCommand.MIFARE_AUTHORIZE_B,
+        AimeReaderCommand.MIFARE_READ,
+    )
 
 
-class AimeReaderResponseDict(TypedDict):
-    length: int
-    address: int
-    sequence: int
-    command: int
-    status: int
-    payload_length: int
-    payload: bytes
+def is_led_request(
+    request: AimeReaderRequest,
+) -> TypeGuard[AimeReaderRequest[ColorRequestPayload]]:
+    return request.command in (
+        AimeReaderCommand.EXT_BOARD_LED_RGB,
+        AimeReaderCommand.EXT_BOARD_LED_RGB_UNKNOWN,
+    )
 
 
-CardInfo = Struct(
+CardInfoFormat = Struct(
     "count" / Int8ul,
     "cards"
     / Array(
@@ -131,7 +175,7 @@ class CardInfoCard(TypedDict):
     id: bytes
 
 
-class CardInfoDict(TypedDict):
+class CardSelectResponsePayload(TypedDict):
     count: int
     cards: list[CardInfoCard]
 
@@ -139,6 +183,34 @@ class CardInfoDict(TypedDict):
 class CardType(IntEnum):
     MIFARE = 0x10
     FELICA = 0x20
+
+
+AimeReaderResponseFormat = Struct(
+    "length" / Int8ul,
+    "address" / Int8ul,
+    "sequence" / Int8ul,
+    "command" / Int8ul,
+    "status" / Int8ul,
+    "payload_length" / Int8ul,
+    "payload"
+    / Switch(
+        this.command,
+        {
+            AimeReaderCommand.CARD_DETECT.value: CardInfoFormat,
+        },
+        Bytes(this.payload_length),
+    ),
+)
+
+
+class AimeReaderResponseDict(TypedDict):
+    length: int
+    address: int
+    sequence: int
+    command: int
+    status: int
+    payload_length: int
+    payload: bytes | CardSelectResponsePayload
 
 
 class AimeReader:
@@ -223,53 +295,126 @@ class AimeReader:
                 and len(self._request_data) == self._request_data[0]
             ):
                 request = cast(
-                    AimeReaderRequestDict, AimeReaderRequest.parse(self._request_data)
+                    AimeReaderRequest,
+                    AimeReaderRequestFormat.parse(self._request_data),
                 )  # pyright: ignore[reportInvalidCast]
                 if self._request_checksum == c:
                     self.handle_request(request)
                     self._request_active = False
                 else:
-                    self.send_response(request, AimeReaderStatus.SUM_ERROR, b"")
+                    self.send_response(request, AimeReaderStatus.CHECKSUM_ERROR, b"")
 
                 continue
 
             self._request_data.append(c)
             self._request_checksum = (self._request_checksum + c) % 256
 
-    def handle_request(self, request: AimeReaderRequestDict):
-        if request["sequence"] <= self._command_sequence and self._command_sequence != 255:
+    def handle_request(self, request: AimeReaderRequest):
+        if request.sequence <= self._command_sequence and self._command_sequence != 255:
             logger.warning(
                 "requests out of order",
                 current_sequence=self._command_sequence,
-                request_sequence=request["sequence"],
+                request_sequence=request.sequence,
             )
 
-        self._command_sequence = request["sequence"]
-        _ = structlog.contextvars.bind_contextvars(sequence=request["sequence"])
+        self._command_sequence = request.sequence
+        _ = structlog.contextvars.bind_contextvars(sequence=request.sequence)
 
-        if request["command"] == AimeReaderCommand.TO_NORMAL_MODE:
+        if is_mifare_request(request):
+            # return AimeReaderStatus.CARD_ERROR if the keys don't match
+            if request.command in (
+                AimeReaderCommand.MIFARE_AUTHORIZE_A,
+                AimeReaderCommand.MIFARE_AUTHORIZE_B,
+            ):
+                logger.debug(
+                    "mifare authorize keyA",
+                    uid=request.payload.uid.hex(),
+                    block_no=request.payload.block_no,
+                )
+
+                if self.card_dump is None or len(self.card_dump) < 64:
+                    self.send_response(request, AimeReaderStatus.CARD_ERROR, b"")
+                    return
+
+                if request.command == AimeReaderCommand.MIFARE_AUTHORIZE_A:
+                    card_key = self.card_dump[48:54]
+                    expected_key = self._mifare_key_a
+                else:
+                    card_key = self.card_dump[58:64]
+                    expected_key = self._mifare_key_b
+
+                # HACK: it's a lot more complicated than this but for our intents and purposes
+                # it should work for now
+                status = (
+                    AimeReaderStatus.OK
+                    if card_key == expected_key
+                    else AimeReaderStatus.CARD_ERROR
+                )
+                self.send_response(request, status, b"")
+                return
+
+            # return mifare card dump
+            if request.command == AimeReaderCommand.MIFARE_READ:
+                block_no = request.payload.block_no
+
+                logger.debug(
+                    "mifare read", uid=request.payload.uid.hex(), block_no=block_no
+                )
+
+                if self.card_dump is None or len(self.card_dump) < 64:
+                    self.send_response(request, AimeReaderStatus.CARD_ERROR, b"")
+                    return
+
+                self.send_response(
+                    request,
+                    AimeReaderStatus.OK,
+                    self.card_dump[16 * block_no : 16 * (block_no + 1)],
+                )
+                return
+
+            logger.warning(
+                "unhandled mifare command",
+                command=request.command,
+                payload=request.payload,
+            )
+            self.send_response(request, AimeReaderStatus.INVALID_COMMAND, b"")
+
+            return
+
+        # set reader LED, does not need a response
+        if is_led_request(request):
+            logger.debug(
+                "set LED",
+                command=request.command,
+                r=request.payload.r,
+                g=request.payload.g,
+                b=request.payload.b,
+            )
+            return
+
+        if request.command == AimeReaderCommand.TO_NORMAL_MODE:
             logger.debug("to normal mode")
             self.send_response(request, AimeReaderStatus.INVALID_COMMAND, b"")
             return
 
-        if request["command"] == AimeReaderCommand.GET_FW_VERSION:
+        if request.command == AimeReaderCommand.GET_FW_VERSION:
             logger.debug("get firmware version")
             self.send_response(request, AimeReaderStatus.OK, self.fw_version)
             return
 
-        if request["command"] == AimeReaderCommand.GET_HW_VERSION:
+        if request.command == AimeReaderCommand.GET_HW_VERSION:
             logger.debug("get hardware version")
             self.send_response(request, AimeReaderStatus.OK, self.hw_version)
             return
 
-        if request["command"] == AimeReaderCommand.START_POLLING:
+        if request.command == AimeReaderCommand.START_POLLING:
             logger.debug("start polling")
             self._is_polling = True
             self._last_poll_time = time.time()
             self.send_response(request, AimeReaderStatus.OK, b"")
             return
 
-        if request["command"] == AimeReaderCommand.STOP_POLLING:
+        if request.command == AimeReaderCommand.STOP_POLLING:
             logger.debug("stop polling")
             self._is_polling = False
             self.send_response(request, AimeReaderStatus.OK, b"")
@@ -277,17 +422,23 @@ class AimeReader:
 
         # return the UID of the detected card using the CardInfo struct
         # if there are no cards, return 0
-        if request["command"] == AimeReaderCommand.CARD_DETECT:
+        if request.command == AimeReaderCommand.CARD_DETECT:
             logger.debug("card detect")
 
             if time.time() > self.card_dump_valid_until:
                 self.card_dump = None
 
             if self.card_dump is None:
-                self.send_response(request, AimeReaderStatus.OK, CardInfo.build({"count": 0, "cards": []}))
+                self.send_response(
+                    request,
+                    AimeReaderStatus.OK,
+                    {"count": 0, "cards": []},
+                )
                 return
 
-            payload = CardInfo.build(
+            self.send_response(
+                request,
+                AimeReaderStatus.OK,
                 {
                     "count": 1,
                     "cards": [
@@ -297,12 +448,11 @@ class AimeReader:
                             "id": self.card_dump[:4],
                         }
                     ],
-                }
+                },
             )
-            self.send_response(request, AimeReaderStatus.OK, payload=payload)
             return
 
-        if request["command"] in (
+        if request.command in (
             AimeReaderCommand.CARD_SELECT,
             AimeReaderCommand.CARD_HALT,
         ):
@@ -310,143 +460,72 @@ class AimeReader:
             self.send_response(request, AimeReaderStatus.OK, b"")
             return
 
-        if request["command"] == AimeReaderCommand.MIFARE_KEY_SET_A:
-            logger.debug("mifare set keyA", payload=request["payload"].hex())
-            self._mifare_key_a = request["payload"][:6]
+        if request.command == AimeReaderCommand.MIFARE_KEY_SET_A:
+            logger.debug("mifare set keyA", payload=request.payload.hex())
+            self._mifare_key_a = request.payload[:6]
             self.send_response(request, AimeReaderStatus.OK, b"")
             return
 
-        if request["command"] == AimeReaderCommand.MIFARE_KEY_SET_B:
-            logger.debug("mifare set keyB", payload=request["payload"].hex())
-            self._mifare_key_b = request["payload"][:6]
+        if request.command == AimeReaderCommand.MIFARE_KEY_SET_B:
+            logger.debug("mifare set keyB", payload=request.payload.hex())
+            self._mifare_key_b = request.payload[:6]
             self.send_response(request, AimeReaderStatus.OK, b"")
             return
 
-        # return AimeReaderStatus.CARD_ERROR if the keys don't match
-        if request["command"] == AimeReaderCommand.MIFARE_AUTHORIZE_A:
-            logger.debug(
-                "mifare authorize keyA",
-                uid=request["payload"][:4].hex(),
-                block_no=request["payload"][4],
-            )
-
-            if self.card_dump is None or len(self.card_dump) < 64:
-                self.send_response(request, AimeReaderStatus.CARD_ERROR, b"")
-                return
-
-            # HACK: it's a lot more complicated than this but for our intents and purposes
-            # it should work for now
-            card_key_a = self.card_dump[48:54]
-            status = (
-                AimeReaderStatus.OK
-                if card_key_a == self._mifare_key_a
-                else AimeReaderStatus.CARD_ERROR
-            )
-            self.send_response(request, status, b"")
-            return
-
-        if request["command"] == AimeReaderCommand.MIFARE_AUTHORIZE_B:
-            logger.debug(
-                "mifare authorize keyB",
-                uid=request["payload"][:4].hex(),
-                block_no=request["payload"][4],
-            )
-
-            if self.card_dump is None or len(self.card_dump) < 64:
-                self.send_response(request, AimeReaderStatus.CARD_ERROR, b"")
-                return
-
-            # HACK: see keyA
-            card_key_b = self.card_dump[58:64]
-            status = (
-                AimeReaderStatus.OK
-                if card_key_b == self._mifare_key_b
-                else AimeReaderStatus.CARD_ERROR
-            )
-            self.send_response(request, status, b"")
-            return
-
-        # return mifare card dump
-        if request["command"] == AimeReaderCommand.MIFARE_READ:
-            block_no = request["payload"][4]
-            logger.debug(
-                "mifare read", uid=request["payload"][:4].hex(), block_no=block_no
-            )
-
-            if self.card_dump is None or len(self.card_dump) < 64:
-                self.send_response(request, AimeReaderStatus.CARD_ERROR, b"")
-                return
-
-            self.send_response(
-                request,
-                AimeReaderStatus.OK,
-                self.card_dump[16 * block_no : 16 * (block_no + 1)],
-            )
-            return
-
-        # set reader LED, does not need a response
-        if request["command"] in (
-            AimeReaderCommand.EXT_BOARD_LED_RGB,
-            AimeReaderCommand.EXT_BOARD_LED_RGB_UNKNOWN,
-        ):
-            logger.debug(
-                "set LED",
-                command=request["command"],
-                r=request["payload"][0],
-                g=request["payload"][1],
-                b=request["payload"][2],
-            )
-            return
-
-        if request["command"] == AimeReaderCommand.EXT_BOARD_INFO:
+        if request.command == AimeReaderCommand.EXT_BOARD_INFO:
             logger.debug("get LED info")
             self.send_response(request, AimeReaderStatus.OK, self.led_info)
             return
 
-        if request["command"] in (
+        if request.command in (
             AimeReaderCommand.TO_UPDATER_MODE,
             AimeReaderCommand.EXT_TO_NORMAL_MODE,
             AimeReaderCommand.SEND_BINDATA_INIT,
         ):
-            logger.debug("updater mode stuff", command=request["command"])
+            logger.debug("updater mode stuff", command=request.command)
             self.send_response(request, AimeReaderStatus.OK, b"")
             return
 
-        if request["command"] == AimeReaderCommand.SEND_BINDATA_EXEC:
-            logger.debug(
-                "sending update data", payload_length=request["payload_length"]
-            )
+        if request.command == AimeReaderCommand.SEND_BINDATA_EXEC:
+            logger.debug("sending update data", payload_length=request.payload_length)
             self.send_response(request, AimeReaderStatus.FIRM_UPDATE_SUCCESS, b"")
             return
 
-        if request["command"] == AimeReaderCommand.SEND_HEX_DATA:
-            logger.debug("sending hex data", payload_length=request["payload_length"])
+        if request.command == AimeReaderCommand.SEND_HEX_DATA:
+            logger.debug("sending hex data", payload_length=request.payload_length)
             self.send_response(request, AimeReaderStatus.COMP_DUMMY_3RD, b"")
             return
 
         logger.debug(
             "unknown command",
-            command=request["command"],
-            payload=request["payload"].hex(),
+            command=request.command,
+            payload=request.payload.hex(),
         )
         self.send_response(request, AimeReaderStatus.INVALID_COMMAND, b"")
 
     def send_response(
-        self, request: AimeReaderRequestDict, status: AimeReaderStatus, payload: bytes
+        self,
+        request: AimeReaderRequest[Any],  # pyright: ignore[reportExplicitAny]
+        status: AimeReaderStatus,
+        payload: bytes | CardSelectResponsePayload,
     ):
         response: AimeReaderResponseDict = {
             "length": len(payload) + 6,
-            "address": request["address"],
-            "sequence": request["sequence"],
-            "command": request["command"],
+            "address": request.address,
+            "sequence": request.sequence,
+            "command": request.command,
             "status": status.value,
             "payload_length": len(payload),
             "payload": payload,
         }
 
-        logger.debug("sending response", status=status, payload=payload.hex())
+        logger.debug(
+            "sending response",
+            status=status,
+            payload=payload.hex() if isinstance(payload, bytes) else payload,
+        )
 
-        data = AimeReaderResponse.build(cast(dict[str, Any], response))  # pyright: ignore[reportInvalidCast, reportExplicitAny]
+        data = AimeReaderResponseFormat.build(cast(dict[str, Any], response))  # pyright: ignore[reportInvalidCast, reportExplicitAny]
         escaped_data = bytearray([0xE0])
         checksum = 0
 
@@ -489,7 +568,7 @@ async def amnet_signin(request: Request):
             status_code=HTTP_429_TOO_MANY_REQUESTS,
             headers={
                 "Retry-After": f"{int(reader.card_dump_valid_until - current_time)}"
-            }
+            },
         )
 
     data = await request.json()
@@ -564,7 +643,7 @@ async def signin(request: Request):
             status_code=HTTP_429_TOO_MANY_REQUESTS,
             headers={
                 "Retry-After": f"{int(reader.card_dump_valid_until - current_time)}"
-            }
+            },
         )
 
     content_type = request.headers.get("content-type")
