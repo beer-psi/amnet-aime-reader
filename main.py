@@ -291,9 +291,10 @@ class AimeReader:
                 )  # pyright: ignore[reportInvalidCast]
                 if self._request_checksum == c:
                     self.handle_request(request)
-                    self._request_active = False
                 else:
                     self.send_response(request, AimeReaderStatus.CHECKSUM_ERROR, b"")
+
+                self._request_active = False
 
                 continue
 
@@ -449,7 +450,7 @@ class AimeReader:
             AimeReaderCommand.CARD_SELECT,
             AimeReaderCommand.CARD_HALT,
         ):
-            logger.debug("card select/halt")
+            logger.debug("card select/halt", command=AimeReaderCommand(request.command))
             self.send_response(request, AimeReaderStatus.OK, b"")
             return
 
