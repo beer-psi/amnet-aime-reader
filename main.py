@@ -97,7 +97,6 @@ AimeReaderRequestFormat = Struct(
     / Switch(
         this.command,
         {
-            AimeReaderCommand.CARD_SELECT.value: MifareCardRequest,
             AimeReaderCommand.MIFARE_AUTHORIZE_A.value: MifareCardRequest,
             AimeReaderCommand.MIFARE_AUTHORIZE_B.value: MifareCardRequest,
             AimeReaderCommand.MIFARE_READ.value: MifareCardRequest,
@@ -139,7 +138,6 @@ def is_mifare_request(
     request: AimeReaderRequest,
 ) -> TypeGuard[AimeReaderRequest[MifareRequestPayload]]:
     return request.command in (
-        AimeReaderCommand.CARD_SELECT,
         AimeReaderCommand.MIFARE_AUTHORIZE_A,
         AimeReaderCommand.MIFARE_AUTHORIZE_B,
         AimeReaderCommand.MIFARE_READ,
