@@ -126,7 +126,7 @@ CK_GEN_KEY = [
 ]
 
 
-def felica_mac_generate_ck_inner(data: bytes, id_key: int):
+def aicc_generate_card_key_inner(data: bytes, id_key: int):
     cipher = DES3.new(CK_GEN_KEY[0] + CK_GEN_KEY[1] + CK_GEN_KEY[2], DES3.MODE_ECB)
     data = cipher.encrypt(data)
 
@@ -153,11 +153,11 @@ def aicc_generate_card_key(id: bytearray):
         data[7] ^= 0x1B
 
     id_key = int.from_bytes(data, "little") ^ int.from_bytes(id[8:16], "little")
-    key0 = felica_mac_generate_ck_inner(id[0:8], id_key)
+    key0 = aicc_generate_card_key_inner(id[0:8], id_key)
 
     id[0] ^= 0x80
 
-    key1 = felica_mac_generate_ck_inner(id[0:8], id_key)
+    key1 = aicc_generate_card_key_inner(id[0:8], id_key)
 
     id[0] ^= 0x80
 
