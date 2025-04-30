@@ -285,7 +285,6 @@ class AICCard:
             mac_data += b"\x91\x00"
             mac_data = mac_data.ljust(8, b"\xff") + data
 
-            # technically the next 3 bytes of MAC_A is write count, but we already return write count 0.
             maca = (
                 felica_generate_mac(mac_data, session_key, rc[0:8])
                 + self.read_block(0x90)[:3]
