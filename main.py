@@ -460,7 +460,6 @@ class AimeReader:
         self._card_lock: threading.Lock = threading.Lock()
         self._mifare_card: bytes | None = None
         self._mifare_card_authorized_key: str | None = None
-        self._mifare_card_authorized_blocks: list[int] = []
         self._aic_card: AICCard | None = None
         self._card_valid_until: float = 0
 
@@ -511,7 +510,7 @@ class AimeReader:
     def fw_version(self):
         """The firmware version of the reader, inferred from the generation."""
 
-        return [b"TN32MSEC003S F/W Ver1.2", b"\x94", b"\x94"][self.generation - 1]
+        return [b"TN32MSEC003S F/W Ver1.2", b"\x92", b"\x94"][self.generation - 1]
 
     @property
     def hw_version(self):
@@ -537,7 +536,7 @@ class AimeReader:
     def baud_rate(self):
         """The baud rate of the reader serial communications, inferred from the generation."""
 
-        return [9600, 115200, 115200][self.generation - 1]
+        return 9600 if self.generation == 1 else 115200
 
     @property
     def last_poll_time(self):
@@ -655,9 +654,11 @@ class AimeReader:
         self._prepare_for_sending(request, AimeReaderStatus.OK, b"")
 
     def _handle_get_fw_version(self, request: AimeReaderRequest):
+        logger.debug("reporting firmware version", fw_version=self.fw_version)
         self._prepare_for_sending(request, AimeReaderStatus.OK, self.fw_version)
 
     def _handle_get_hw_version(self, request: AimeReaderRequest):
+        logger.debug("reporting hardware version", hw_version=self.hw_version)
         self._prepare_for_sending(request, AimeReaderStatus.OK, self.hw_version)
 
     def _handle_start_polling(self, request: AimeReaderRequest):
@@ -674,7 +675,6 @@ class AimeReader:
         if time.monotonic() > self._card_valid_until:
             self._mifare_card = None
             self._mifare_card_authorized_key = None
-            self._mifare_card_authorized_blocks.clear()
             self._aic_card = None
 
         cards: list[CardDetectInfo] = []
@@ -736,14 +736,12 @@ class AimeReader:
         ):
             status = AimeReaderStatus.OK
             self._mifare_card_authorized_key = "a"
-            self._mifare_card_authorized_blocks.append(block_no)
         elif (
             request.command == AimeReaderCommand.MIFARE_AUTHORIZE_B
             and self._mifare_card[58:64] == self._mifare_key_b
         ):
             status = AimeReaderStatus.OK
             self._mifare_card_authorized_key = "b"
-            self._mifare_card_authorized_blocks.append(block_no)
         else:
             status = AimeReaderStatus.CARD_ERROR
             self._mifare_card_authorized_key = None
@@ -771,14 +769,6 @@ class AimeReader:
             )
             self._prepare_for_sending(request, AimeReaderStatus.CARD_ERROR, b"")
             return
-
-        if block_no not in self._mifare_card_authorized_blocks:
-            logger.error(
-                "unauthenticated block",
-                uid=request.payload.uid,
-                block_no=block_no,
-                authenticated=self._mifare_card_authorized_blocks,
-            )
 
         acs = self._mifare_card[54:58]
         c3 = (acs[2] >> 4) & 0x0F
@@ -921,8 +911,9 @@ class AimeReader:
         logger.info(
             "sending response",
             address=response["address"],
-            command=AimeReaderCommand(response["command"]),
             sequence=response["sequence"],
+            command=AimeReaderCommand(response["command"]),
+            status=response["status"],
             payload=payload.hex() if isinstance(payload, bytes) else payload,
         )
         data = AimeReaderResponseFormat.build(cast(dict[str, Any], response))  # pyright: ignore[reportInvalidCast]
@@ -1132,7 +1123,7 @@ app = Starlette(debug=False, routes=routes, middleware=middleware)
 
 
 def main():
-    manager = AimeReaderManager("COM31", 2)
+    manager = AimeReaderManager("COM31", 1)
 
     _ = signal.signal(signal.SIGTERM, lambda s, f: manager.close())
     _ = signal.signal(signal.SIGINT, lambda s, f: manager.close())
