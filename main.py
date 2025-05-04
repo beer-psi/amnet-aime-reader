@@ -1,4 +1,6 @@
 # pyright: reportAny=false
+from collections.abc import Callable
+from dataclasses import dataclass
 import re
 import signal
 import string
@@ -6,7 +8,7 @@ import threading
 import time
 from enum import IntEnum
 from time import sleep
-from typing import Any, Generic, Literal, Protocol, TypeGuard, TypeVar, TypedDict, cast
+from typing import Any, Generic, Literal, Protocol, TypeVar, TypedDict, cast
 
 import serial
 import structlog
@@ -15,6 +17,8 @@ from construct import (
     Array,
     Bytes,
     Const,
+    ConstructError,
+    Container,
     GreedyBytes,
     If,
     Int16ub,
@@ -60,22 +64,23 @@ class AimeReaderCommand(IntEnum):
     MIFARE_KEY_SET_B = 0x54
     MIFARE_AUTHORIZE_B = 0x55
 
-    TO_UPDATER_MODE = 0x60
+    ENTER_UPDATER_MODE = 0x60
     SEND_HEX_DATA = 0x61
-    TO_NORMAL_MODE = 0x62
+    RESET = 0x62
     SEND_BINDATA_INIT = 0x63
     SEND_BINDATA_EXEC = 0x64
 
     FELICA_PUSH = 0x70
     FELICA_ENCAP = 0x71
 
-    EXT_BOARD_LED_RGB = 0x81
-    EXT_BOARD_LED_RGB_UNKNOWN = 0x82
-    EXT_BOARD_INFO = 0xF0
-    EXT_FIRM_SUM = 0xF2
-    EXT_SEND_HEX_DATA = 0xF3
-    EXT_TO_BOOT_MODE = 0xF4
-    EXT_TO_NORMAL_MODE = 0xF5
+    LED_SET_COLOR_RGB = 0x81
+    LED_SET_COLOR_RGB_UNKNOWN = 0x82
+
+    LED_GET_BOARD_INFO = 0xF0
+    LED_FIRMWARE_SUM = 0xF2
+    LED_SEND_HEX_DATA = 0xF3
+    LED_ENTER_BOOT_MODE = 0xF4
+    LED_RESET = 0xF5
 
 
 class AimeReaderStatus(IntEnum):
@@ -157,30 +162,28 @@ FelicaEncapRequestFormat = Struct(
     ),
 )
 
-AimeReaderRequestFormat = Prefixed(
-    Int8ul,
-    Struct(
-        "address" / Int8ul,
-        "sequence" / Int8ul,
-        "command" / Int8ul,
-        "payload"
-        / Prefixed(
-            Int8ul,
-            Switch(
-                this.command,
-                {
-                    AimeReaderCommand.MIFARE_AUTHORIZE_A.value: MifareCardRequestFormat,
-                    AimeReaderCommand.MIFARE_AUTHORIZE_B.value: MifareCardRequestFormat,
-                    AimeReaderCommand.MIFARE_READ.value: MifareCardRequestFormat,
-                    AimeReaderCommand.EXT_BOARD_LED_RGB.value: ColorFormat,
-                    AimeReaderCommand.EXT_BOARD_LED_RGB_UNKNOWN.value: ColorFormat,
-                    AimeReaderCommand.FELICA_ENCAP.value: FelicaEncapRequestFormat,
-                },
-                GreedyBytes,
-            ),
+AimeReaderRequestFormat = Struct(
+    "address" / Int8ul,
+    "sequence" / Int8ul,
+    "command" / Int8ul,
+    "payload"
+    / Prefixed(
+        Int8ul,
+        Switch(
+            this.command,
+            {
+                AimeReaderCommand.MIFARE_KEY_SET_A.value: Bytes(6),
+                AimeReaderCommand.MIFARE_KEY_SET_B.value: Bytes(6),
+                AimeReaderCommand.MIFARE_AUTHORIZE_A.value: MifareCardRequestFormat,
+                AimeReaderCommand.MIFARE_AUTHORIZE_B.value: MifareCardRequestFormat,
+                AimeReaderCommand.MIFARE_READ.value: MifareCardRequestFormat,
+                AimeReaderCommand.LED_SET_COLOR_RGB.value: ColorFormat,
+                AimeReaderCommand.LED_SET_COLOR_RGB_UNKNOWN.value: ColorFormat,
+                AimeReaderCommand.FELICA_ENCAP.value: FelicaEncapRequestFormat,
+            },
+            GreedyBytes,
         ),
     ),
-    includelength=True,
 )
 
 
@@ -256,31 +259,6 @@ class AimeReaderRequest(Protocol, Generic[T]):
     sequence: int
     command: int
     payload: T
-
-
-def is_mifare_request(
-    request: AimeReaderRequest,
-) -> TypeGuard[AimeReaderRequest[MifareRequestPayload]]:
-    return request.command in (
-        AimeReaderCommand.MIFARE_AUTHORIZE_A,
-        AimeReaderCommand.MIFARE_AUTHORIZE_B,
-        AimeReaderCommand.MIFARE_READ,
-    )
-
-
-def is_led_request(
-    request: AimeReaderRequest,
-) -> TypeGuard[AimeReaderRequest[ColorRequestPayload]]:
-    return request.command in (
-        AimeReaderCommand.EXT_BOARD_LED_RGB,
-        AimeReaderCommand.EXT_BOARD_LED_RGB_UNKNOWN,
-    )
-
-
-def is_felica_request(
-    request: AimeReaderRequest,
-) -> TypeGuard[AimeReaderRequest[FelicaEncapRequestPayload]]:
-    return request.command == AimeReaderCommand.FELICA_ENCAP
 
 
 CardDetectResponsePayloadFormat = Struct(
@@ -360,28 +338,24 @@ FelicaEncapResponseFormat = Prefixed(
     includelength=True,
 )
 
-AimeReaderResponseFormat = Prefixed(
-    Int8ul,
-    Struct(
-        "address" / Int8ul,
-        "sequence" / Int8ul,
-        "command" / Int8ul,
-        "status" / Int8ul,
-        "payload"
-        / Prefixed(
-            Int8ul,
-            Switch(
-                this.command,
-                {
-                    AimeReaderCommand.CARD_DETECT.value: CardDetectResponsePayloadFormat,
-                    AimeReaderCommand.FELICA_ENCAP.value: FelicaEncapResponseFormat,
-                },
-                GreedyBytes,
-            ),
-            includelength=False,
+AimeReaderResponseFormat = Struct(
+    "address" / Int8ul,
+    "sequence" / Int8ul,
+    "command" / Int8ul,
+    "status" / Int8ul,
+    "payload"
+    / Prefixed(
+        Int8ul,
+        Switch(
+            this.command,
+            {
+                AimeReaderCommand.CARD_DETECT.value: CardDetectResponsePayloadFormat,
+                AimeReaderCommand.FELICA_ENCAP.value: FelicaEncapResponseFormat,
+            },
+            GreedyBytes,
         ),
+        includelength=False,
     ),
-    includelength=True,
 )
 
 
@@ -390,65 +364,608 @@ class AimeReaderResponseDict(TypedDict):
     sequence: int
     command: int
     status: int
-    payload: bytes | CardDetectResponsePayload | dict[str, Any]  # pyright: ignore[reportExplicitAny]
+    payload: bytes | CardDetectResponsePayload | dict[str, Any]
+
+
+@dataclass
+class ComioFrame:
+    data: bytes
+    valid: bool
+
+
+class ComioFrameBuffer:
+    def __init__(self) -> None:
+        self._data: bytearray = bytearray()
+
+    def add_data(self, data: bytes):
+        self._data.extend(data)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> ComioFrame:
+        # First, we check if we have enough data to successfully parse the next frame.
+        # This is at least 2 bytes: a sync byte (0xE0) and the request length. The length
+        # byte is included in the frame length.
+        if len(self._data) < 2:
+            raise StopIteration
+
+        if self._data[0] != 0xE0:
+            msg = f"Received garbage on JVS: {self._data[0]}"
+            raise ValueError(msg)
+
+        length = self._data[1]
+
+        # 256 wraps to 0, and this is valid for whatever reason
+        if length == 0:
+            length = 256
+
+        # Check if we have enough data to parse the entire frame at all. This is not an
+        # exhaustive check; escape bytes are not included in the frame's length. Assuming
+        # no bytes are escaped, this means that the buffer should have at least (2 + length) bytes
+        # (1 sync byte at the beginning, and 1 checksum byte at the end are not counted in the
+        # frame length).
+        if len(self._data) < 2 + length:
+            raise StopIteration
+
+        frame_length = length - 1
+        frame = bytearray()
+        escaping = False
+        checksum = length % 256  # length byte is included in the checksum
+        valid = False
+        read = 0
+
+        for b in self._data[2:]:
+            read += 1
+
+            if b == 0xD0:
+                escaping = True
+                continue
+
+            if escaping:
+                escaping = False
+                b += 1
+
+            # we've read the entire body and this is the checksum byte
+            # remember the given length includes the length byte
+            # however when there's a checksum error we need to communicate
+            # this to the consumer so they can send a checksum error on
+            # our behalf.
+            if len(frame) == frame_length:
+                valid = checksum == b
+                break
+
+            frame.append(b)
+            checksum = (checksum + b) % 256
+
+        # if we've read all of it, remove the frame from the internal buffer
+        # and return the frame's data.
+        if len(frame) == frame_length:
+            self._data = self._data[2 + read :]
+            return ComioFrame(bytes(frame), valid)
+
+        # else we keep the frame for further parsing.
+        raise StopIteration
 
 
 class AimeReader:
-    def __init__(self, port: str, generation: Literal[0, 1, 2]) -> None:
-        self.fw_version: bytes = [b"TN32MSEC003S F/W Ver1.2", b"\x94", b"\x94"][
-            generation
-        ]
-        self.hw_version: bytes = [
+    """
+    Emulation of an official card reader. This is written as a pure state machine
+    that takes in bytes and output bytes, leaving users free to use any I/O approach.
+    """
+
+    def __init__(self, generation: Literal[1, 2, 3]):
+        self.generation: Literal[1, 2, 3] = generation
+
+        self._card_lock: threading.Lock = threading.Lock()
+        self._mifare_card: bytes | None = None
+        self._mifare_card_authorized_key: str | None = None
+        self._mifare_card_authorized_blocks: list[int] = []
+        self._aic_card: AICCard | None = None
+        self._card_valid_until: float = 0
+
+        self._incoming_buffer: ComioFrameBuffer = ComioFrameBuffer()
+        self._output_buffer: bytearray = bytearray()
+        self._closed: bool = False
+        self._handlers: dict[int, Callable[[AimeReaderRequest[Any]], Any]] = {
+            AimeReaderCommand.GET_FW_VERSION.value: self._handle_get_fw_version,
+            AimeReaderCommand.GET_HW_VERSION.value: self._handle_get_hw_version,
+            AimeReaderCommand.START_POLLING.value: self._handle_start_polling,
+            AimeReaderCommand.STOP_POLLING.value: self._handle_stop_polling,
+            AimeReaderCommand.CARD_DETECT.value: self._handle_card_detect,
+            # intended for games with card decks
+            AimeReaderCommand.CARD_SELECT.value: self._handle_noop,
+            # what's this?
+            AimeReaderCommand.CARD_HALT.value: self._handle_noop,
+            AimeReaderCommand.MIFARE_KEY_SET_A.value: self._handle_mifare_set_key,
+            AimeReaderCommand.MIFARE_AUTHORIZE_A.value: self._handle_mifare_authorize,
+            AimeReaderCommand.MIFARE_READ.value: self._handle_mifare_read,
+            # do we want to support writing cards? do games use this?
+            # AimeReaderCommand.MIFARE_WRITE.value
+            AimeReaderCommand.MIFARE_KEY_SET_B.value: self._handle_mifare_set_key,
+            AimeReaderCommand.MIFARE_AUTHORIZE_B.value: self._handle_mifare_authorize,
+            AimeReaderCommand.ENTER_UPDATER_MODE.value: self._handle_noop,
+            AimeReaderCommand.SEND_HEX_DATA.value: self._handle_noop,
+            AimeReaderCommand.RESET.value: self._handle_noop,
+            AimeReaderCommand.SEND_BINDATA_INIT.value: self._handle_noop,
+            AimeReaderCommand.SEND_BINDATA_EXEC.value: self._handle_noop,
+            AimeReaderCommand.FELICA_PUSH.value: self._handle_noop,
+            AimeReaderCommand.FELICA_ENCAP.value: self._handle_felica_encap,
+        }
+        self._led_handlers: dict[int, Callable[[AimeReaderRequest[Any]], Any]] = {
+            AimeReaderCommand.LED_SET_COLOR_RGB.value: self._handle_noop,
+            AimeReaderCommand.LED_SET_COLOR_RGB_UNKNOWN.value: self._handle_noop,
+            AimeReaderCommand.LED_GET_BOARD_INFO.value: self._handle_led_get_board_info,
+            AimeReaderCommand.LED_FIRMWARE_SUM.value: self._handle_noop,
+            AimeReaderCommand.LED_SEND_HEX_DATA.value: self._handle_noop,
+            AimeReaderCommand.LED_ENTER_BOOT_MODE.value: self._handle_noop,
+            AimeReaderCommand.LED_RESET.value: self._handle_noop,
+        }
+
+        self._radio: bool = False
+        self._last_poll_time: float = 0
+        self._mifare_key_a: bytes = bytes.fromhex("6090D00632F5")
+        self._mifare_key_b: bytes = b"WCCFv2"
+
+    @property
+    def fw_version(self):
+        """The firmware version of the reader, inferred from the generation."""
+
+        return [b"TN32MSEC003S F/W Ver1.2", b"\x94", b"\x94"][self.generation - 1]
+
+    @property
+    def hw_version(self):
+        """The hardware version of the reader, inferred from the generation."""
+
+        return [
             b"TN32MSEC003S H/W Ver3.0",
             b"837-15286",
             b"837-15396",
-        ][generation]
-        self.led_info: bytes = [
+        ][self.generation - 1]
+
+    @property
+    def led_info(self):
+        """The info of the LED board associated with the reader, inferred from the generation."""
+
+        return [
             b"15084\xff\x10\x00\x12",
             b"000-00000\xff\x11\x40",
             b"000-00000\xff\x11\x40",
-        ][generation]
-        self.baud_rate: int = [9600, 115200, 115200][generation]
+        ][self.generation - 1]
 
-        self.lock: threading.Lock = threading.Lock()
-        self.mifare_card_dump: bytes | None = None
-        self.aic_card: AICCard | None = None
-        self.card_valid_until: float = 0
+    @property
+    def baud_rate(self):
+        """The baud rate of the reader serial communications, inferred from the generation."""
 
-        self._serial: serial.Serial = serial.Serial(port, self.baud_rate)
-
-        self._command_sequence: int = 0
-        self._request_active: bool = False
-        self._request_len: int = 0
-        self._request_checksum: int = 0
-        self._request_escaping: bool = False
-        self._request_data: bytearray = bytearray()
-
-        self._mifare_key_a: bytes = b""
-        self._mifare_key_b: bytes = b""
-
-        self._is_polling: bool = False
-        self._last_poll_time: float = 0
-
-        self._keep_running: bool = True
+        return [9600, 115200, 115200][self.generation - 1]
 
     @property
     def last_poll_time(self):
         return self._last_poll_time
 
-    def set_mifare_card(self, dump: bytes):
-        with self.lock:
-            self.mifare_card_dump = dump
-            self.card_valid_until = time.time() + 5
+    @property
+    def card_valid_until(self):
+        return self._card_valid_until
 
-    def set_aic_card(self, aic_card: AICCard):
-        with self.lock:
-            self.aic_card = aic_card
-            self.card_valid_until = time.time() + 5
+    @property
+    def mifare_card(self):
+        """
+        The virtual MIFARE Classic card being used to card in to the reader.
+
+        This contains the block 0 of the card.
+        """
+        return self._mifare_card
+
+    @mifare_card.setter
+    def mifare_card(self, value: bytes):
+        with self._card_lock:
+            self._mifare_card = value
+            self._card_valid_until = time.monotonic() + 5
+
+    @property
+    def aic_card(self):
+        """The virtual Amusement IC card being used to card in to the reader."""
+        return self._aic_card
+
+    @aic_card.setter
+    def aic_card(self, value: AICCard):
+        with self._card_lock:
+            self._aic_card = value
+            self._card_valid_until = time.monotonic() + 5
+
+    def receive_data(self, data: bytes | bytearray):
+        """
+        Feed data to the internal buffer of the reader.
+
+        If there is enough data to generate one or more events, they will be added to the list
+        returned from this call.
+
+        Sometimes this call generates outgoing data so it is important to call
+        :meth:`.data_to_send` afterwards and write those bytes to the output.
+        """
+        self._incoming_buffer.add_data(data)
+
+        try:
+            for frame in self._incoming_buffer:
+                try:
+                    request = cast(  # pyright: ignore[reportInvalidCast]
+                        AimeReaderRequest,
+                        AimeReaderRequestFormat.parse(frame.data),
+                    )
+                except ConstructError as e:
+                    logger.exception("invalid request", exc_info=e)
+                    
+                    if len(frame.data) < 3:
+                        # we're just cooked
+                        continue
+
+                    request = cast(  # pyright: ignore[reportInvalidCast]
+                        AimeReaderRequest,
+                        Container(
+                            address=frame.data[0],
+                            sequence=frame.data[1],
+                            command=frame.data[2],
+                        )
+                    )
+                    self._prepare_for_sending(
+                        request, AimeReaderStatus.INVALID_DATA, b""
+                    )
+                    continue
+
+                if frame.valid:
+                    if request.address == 8:  # address of the LED sub-board
+                        handler = self._led_handlers.get(request.command)
+                    else:
+                        handler = self._handlers.get(request.command)
+
+                    if handler is None:
+                        logger.warning(
+                            "unknown request",
+                            address=request.address,
+                            sequence=request.sequence,
+                            command=request.command,
+                            payload=request.payload.hex()
+                            if isinstance(request.payload, bytes)
+                            else request.payload,
+                        )
+                        self._prepare_for_sending(
+                            request, AimeReaderStatus.INVALID_COMMAND, b""
+                        )
+                    else:
+                        logger.info(
+                            "received request",
+                            address=request.address,
+                            sequence=request.sequence,
+                            command=AimeReaderCommand(request.command),
+                            payload=request.payload.hex()
+                            if isinstance(request.payload, bytes)
+                            else request.payload,
+                        )
+                        handler(request)
+                else:
+                    logger.warning("checksum error", data=frame.data.hex())
+                    self._prepare_for_sending(
+                        request, AimeReaderStatus.CHECKSUM_ERROR, b""
+                    )
+        except ValueError as e:
+            msg = "Received invalid data."
+            raise ValueError(msg) from e
+
+    def _handle_noop(self, request: AimeReaderRequest):
+        self._prepare_for_sending(request, AimeReaderStatus.OK, b"")
+
+    def _handle_get_fw_version(self, request: AimeReaderRequest):
+        self._prepare_for_sending(request, AimeReaderStatus.OK, self.fw_version)
+
+    def _handle_get_hw_version(self, request: AimeReaderRequest):
+        self._prepare_for_sending(request, AimeReaderStatus.OK, self.hw_version)
+
+    def _handle_start_polling(self, request: AimeReaderRequest):
+        self._radio = True
+        self._prepare_for_sending(request, AimeReaderStatus.OK, b"")
+
+    def _handle_stop_polling(self, request: AimeReaderRequest):
+        self._radio = False
+        self._prepare_for_sending(request, AimeReaderStatus.OK, b"")
+
+    def _handle_card_detect(self, request: AimeReaderRequest):
+        self._last_poll_time = time.monotonic()
+
+        if time.monotonic() > self._card_valid_until:
+            self._mifare_card = None
+            self._mifare_card_authorized_key = None
+            self._mifare_card_authorized_blocks.clear()
+            self._aic_card = None
+
+        cards: list[CardDetectInfo] = []
+
+        if self._radio and self._mifare_card is not None:
+            cards.append(
+                {
+                    "type": CardType.MIFARE.value,
+                    "id": self._mifare_card[:4],
+                }
+            )
+        elif self._radio and self._aic_card is not None:
+            cards.append(
+                {
+                    "type": CardType.FELICA.value,
+                    "id": self._aic_card.read_block(0x83),
+                }
+            )
+
+        self._prepare_for_sending(
+            request, AimeReaderStatus.OK, {"count": len(cards), "cards": cards}
+        )
+
+    def _handle_mifare_set_key(self, request: AimeReaderRequest):
+        if request.command == AimeReaderCommand.MIFARE_KEY_SET_A:
+            self._mifare_key_a = request.payload
+        elif request.command == AimeReaderCommand.MIFARE_KEY_SET_B:
+            self._mifare_key_b = request.payload
+
+        self._prepare_for_sending(request, AimeReaderStatus.OK, b"")
+
+    def _handle_mifare_authorize(
+        self, request: AimeReaderRequest[MifareRequestPayload]
+    ):
+        block_no = request.payload.block_no
+
+        if block_no > 3:
+            logger.warning("block out of range", block_no=block_no)
+            self._prepare_for_sending(request, AimeReaderStatus.CARD_ERROR, b"")
+            return
+
+        if self._mifare_card is None or len(self._mifare_card) < 64:
+            logger.error("no cards are present")
+            self._prepare_for_sending(request, AimeReaderStatus.CARD_ERROR, b"")
+            return
+
+        if request.payload.uid != self._mifare_card[:4]:
+            logger.error(
+                "uid mismatch",
+                requested_uid=request.payload.uid,
+                present_uid=self._mifare_card[:4],
+            )
+            self._prepare_for_sending(request, AimeReaderStatus.CARD_ERROR, b"")
+            return
+
+        if (
+            request.command == AimeReaderCommand.MIFARE_AUTHORIZE_A
+            and self._mifare_card[48:54] == self._mifare_key_a
+        ):
+            status = AimeReaderStatus.OK
+            self._mifare_card_authorized_key = "a"
+            self._mifare_card_authorized_blocks.append(block_no)
+        elif (
+            request.command == AimeReaderCommand.MIFARE_AUTHORIZE_B
+            and self._mifare_card[58:64] == self._mifare_key_b
+        ):
+            status = AimeReaderStatus.OK
+            self._mifare_card_authorized_key = "b"
+            self._mifare_card_authorized_blocks.append(block_no)
+        else:
+            status = AimeReaderStatus.CARD_ERROR
+            self._mifare_card_authorized_key = None
+
+        self._prepare_for_sending(request, status, b"")
+
+    def _handle_mifare_read(self, request: AimeReaderRequest[MifareRequestPayload]):
+        block_no = request.payload.block_no
+
+        if block_no > 3:
+            logger.warning("block out of range", block_no=block_no)
+            self._prepare_for_sending(request, AimeReaderStatus.CARD_ERROR, b"")
+            return
+
+        if self._mifare_card is None or len(self._mifare_card) < 64:
+            logger.error("no cards are present")
+            self._prepare_for_sending(request, AimeReaderStatus.CARD_ERROR, b"")
+            return
+
+        if request.payload.uid != self._mifare_card[:4]:
+            logger.error(
+                "uid mismatch",
+                requested_uid=request.payload.uid,
+                present_uid=self._mifare_card[:4],
+            )
+            self._prepare_for_sending(request, AimeReaderStatus.CARD_ERROR, b"")
+            return
+
+        if block_no not in self._mifare_card_authorized_blocks:
+            logger.error(
+                "unauthenticated block",
+                uid=request.payload.uid,
+                block_no=block_no,
+                authenticated=self._mifare_card_authorized_blocks,
+            )
+
+        acs = self._mifare_card[54:58]
+        c3 = (acs[2] >> 4) & 0x0F
+        c3_inv = acs[1] & 0x0F
+        c2 = acs[2] & 0x0F
+        c2_inv = (acs[0] >> 4) & 0x0F
+        c1 = (acs[1] >> 4) & 0x0F
+        c1_inv = acs[0] & 0x0F
+
+        # invalid access conditions
+        if c3 != (0x0F - c3_inv) or c2 != (0x0F - c2_inv) or c1 != (0x0F - c1_inv):
+            self._prepare_for_sending(request, AimeReaderStatus.CARD_ERROR, b"")
+            return
+
+        ac = (
+            ((c3 >> block_no) & 1) << 2
+            | ((c2 >> block_no) & 1) << 1
+            | ((c1 >> block_no) & 1)
+        )
+
+        # keyA|B for everything but 011 and 101
+        # never read if 111
+        if ac == 0b111 or (
+            ac in (0b011, 0b101) and self._mifare_card_authorized_key == "a"
+        ):
+            self._prepare_for_sending(request, AimeReaderStatus.CARD_ERROR, b"")
+            return
+
+        self._prepare_for_sending(
+            request,
+            AimeReaderStatus.OK,
+            self._mifare_card[16 * block_no : 16 * (block_no + 1)],
+        )
+
+    def _handle_felica_encap(
+        self, request: AimeReaderRequest[FelicaEncapRequestPayload]
+    ):
+        if self._aic_card is None:
+            logger.error("received felica request, but no AIC cards exist")
+            self._prepare_for_sending(request, AimeReaderStatus.INTERNAL_ERROR, b"")
+            return
+
+        packet = request.payload.packet
+        response_payload: dict[str, Any] = {
+            "command": packet.command + 1,
+            "payload": {},
+        }
+
+        if packet.command == FelicaCommand.POLL:
+            logger.debug("felica poll", payload=packet.payload)
+
+            payload = cast(FelicaPollRequestPayload, packet.payload)
+            idm_pmm = self._aic_card.read_block(0x83)
+            response_payload["payload"] = {
+                "idm": idm_pmm[0:8],
+                "pmm": idm_pmm[8:16],
+                "system_code": 0x88B4,
+            }
+
+            # python typing bullshit made me do this instead of the natural
+            # payload["system_code"] = 0x88B4, since if you add system_code
+            # in later the payload gets inferred as dict[str, bytes] and int
+            # is not bytes.
+            if payload.request_code != 0x01:
+                del response_payload["payload"]["system_code"]
+        elif packet.command == FelicaCommand.READ_WITHOUT_ENCRYPTION:
+            logger.debug("felica read without encryption", payload=packet.payload)
+
+            payload = cast(FelicaReadWithoutEncryptionRequestPayload, packet.payload)
+            idm_pmm = self._aic_card.read_block(0x83)
+            response_payload["payload"] = {
+                "idm": idm_pmm[0:8],
+                "status_flag_1": 0,
+                "status_flag_2": 0,
+                "block_count": payload.read_block_count,
+                "blocks": self._aic_card.read_blocks(
+                    [x & 0xFF for x in payload.read_blocks]
+                ),
+            }
+        elif packet.command == FelicaCommand.WRITE_WITHOUT_ENCRYPTION:
+            logger.debug("felica write without encryption", payload=packet.payload)
+
+            payload = cast(FelicaWriteWithoutEncryptionRequestPayload, packet.payload)
+            idm_pmm = self._aic_card.read_block(0x83)
+            response_payload["payload"] = {
+                "idm": idm_pmm[0:8],
+                "status_flag_1": 0,
+                "status_flag_2": 0,
+            }
+
+            for block_num, block_data in zip(
+                payload.write_blocks, payload.write_block_data
+            ):
+                self._aic_card.write_block(block_num & 0xFF, block_data)
+        elif packet.command == FelicaCommand.GET_SYSTEM_CODE:
+            logger.debug("felica get system code")
+
+            idm_pmm = self._aic_card.read_block(0x83)
+            sys_c = self._aic_card.read_block(0x85)
+            response_payload["payload"] = {
+                "idm": idm_pmm[0:8],
+                "system_code_count": 1,
+                "system_codes": [int.from_bytes(sys_c[0:2], "big")],
+            }
+        elif packet.command == FelicaCommand.ACTIVE:
+            logger.debug("felica active", payload=packet.payload)
+
+            payload = cast(FelicaActiveRequestPayload, packet.payload)
+            idm_pmm = self._aic_card.read_block(0x83)
+            response_payload["payload"] = {
+                "idm": idm_pmm[0:8],
+                "value": 0,
+            }
+
+            if payload.value == 0:  # Alive check
+                response_payload["payload"]["value"] = 0
+            elif payload.value == 1:  # OS version
+                response_payload["payload"]["value"] = 0
+            elif payload.value == 2:  # something
+                response_payload["payload"]["value"] = 0xFF
+
+        self._prepare_for_sending(request, AimeReaderStatus.OK, response_payload)
+
+    def _handle_led_get_board_info(self, request: AimeReaderRequest):
+        self._prepare_for_sending(request, AimeReaderStatus.OK, self.led_info)
+
+    def _prepare_for_sending(
+        self,
+        request: AimeReaderRequest[Any],
+        status: AimeReaderStatus,
+        payload: bytes | CardDetectResponsePayload | dict[str, Any],
+    ):
+        response: AimeReaderResponseDict = {
+            "address": request.address,
+            "sequence": request.sequence,
+            "command": request.command,
+            "status": status.value,
+            "payload": payload,
+        }
+        logger.info(
+            "sending response",
+            address=response["address"],
+            command=AimeReaderCommand(response["command"]),
+            sequence=response["sequence"],
+            payload=payload.hex() if isinstance(payload, bytes) else payload,
+        )
+        data = AimeReaderResponseFormat.build(cast(dict[str, Any], response))  # pyright: ignore[reportInvalidCast]
+
+        self._output_buffer.append(0xE0)
+        self._output_buffer.append((len(data) + 1) % 256)
+        checksum = self._output_buffer[-1]
+
+        for c in data:
+            if c in (0xE0, 0xD0):
+                self._output_buffer.append(0xD0)
+                self._output_buffer.append(c - 1)
+            else:
+                self._output_buffer.append(c)
+
+            checksum = (c + checksum) % 256
+
+        self._output_buffer.append(checksum)
+
+    def data_to_send(self, amount: int | None = None):
+        """
+        Returns some data for sending out of the internal data buffer.
+        """
+        if amount is None:
+            data = bytes(self._output_buffer)
+            self._output_buffer.clear()
+            return data
+
+        data = bytes(self._output_buffer[:amount])
+        self._output_buffer = self._output_buffer[amount:]
+        return data
+
+
+class AimeReaderManager:
+    def __init__(self, port: str, generation: Literal[1, 2, 3]) -> None:
+        self.reader: AimeReader = AimeReader(generation)
+        self._serial: serial.Serial = serial.Serial(port, self.reader.baud_rate)
+
+        self._keep_running: bool = True
 
     def start(self):
         while self._keep_running:
-            sleep(0.0075 if self.baud_rate == 9600 else 0.002)
+            sleep(0.0075 if self.reader.baud_rate == 9600 else 0.002)
             self.poll()
         self._serial.close()
 
@@ -462,403 +979,44 @@ class AimeReader:
             return
 
         data = self._serial.read(in_waiting)
+        # logger.debug("incoming data", data=data.hex())
+        self.reader.receive_data(data)
 
-        for c in data:
-            if c == 0xE0:
-                self._request_active = True
-                self._request_len = 0
-                self._request_checksum = 0
-                self._request_escaping = False
-                self._request_data.clear()
-                continue
+        outgoing_data = self.reader.data_to_send()
 
-            if not self._request_active:
-                continue
-
-            if c == 0xD0:
-                self._request_escaping = True
-                continue
-
-            if self._request_escaping:
-                c += 1
-                self._request_escaping = False
-
-            if (
-                len(self._request_data) > 0
-                and len(self._request_data) == self._request_data[0]
-            ):
-                request = cast(
-                    AimeReaderRequest,
-                    AimeReaderRequestFormat.parse(self._request_data),
-                )  # pyright: ignore[reportInvalidCast]
-                if self._request_checksum == c:
-                    self.handle_request(request)
-                else:
-                    self.send_response(request, AimeReaderStatus.CHECKSUM_ERROR, b"")
-
-                self._request_active = False
-
-                continue
-
-            self._request_data.append(c)
-            self._request_checksum = (self._request_checksum + c) % 256
-
-    def handle_request(self, request: AimeReaderRequest):
-        if request.sequence <= self._command_sequence and self._command_sequence != 255:
-            logger.warning(
-                "requests out of order",
-                current_sequence=self._command_sequence,
-                request_sequence=request.sequence,
-            )
-
-        self._command_sequence = request.sequence
-        _ = structlog.contextvars.bind_contextvars(sequence=request.sequence)
-
-        if is_mifare_request(request):
-            # return AimeReaderStatus.CARD_ERROR if the keys don't match
-            if request.command in (
-                AimeReaderCommand.MIFARE_AUTHORIZE_A,
-                AimeReaderCommand.MIFARE_AUTHORIZE_B,
-            ):
-                logger.debug(
-                    "mifare authorize keyA",
-                    uid=request.payload.uid.hex(),
-                    block_no=request.payload.block_no,
-                )
-
-                if self.mifare_card_dump is None or len(self.mifare_card_dump) < 64:
-                    self.send_response(request, AimeReaderStatus.CARD_ERROR, b"")
-                    return
-
-                if request.command == AimeReaderCommand.MIFARE_AUTHORIZE_A:
-                    card_key = self.mifare_card_dump[48:54]
-                    expected_key = self._mifare_key_a
-                else:
-                    card_key = self.mifare_card_dump[58:64]
-                    expected_key = self._mifare_key_b
-
-                # HACK: it's a lot more complicated than this but for our intents and purposes
-                # it should work for now
-                status = (
-                    AimeReaderStatus.OK
-                    if card_key == expected_key
-                    else AimeReaderStatus.CARD_ERROR
-                )
-                self.send_response(request, status, b"")
-                return
-
-            # return mifare card dump
-            if request.command == AimeReaderCommand.MIFARE_READ:
-                block_no = request.payload.block_no
-
-                logger.debug(
-                    "mifare read", uid=request.payload.uid.hex(), block_no=block_no
-                )
-
-                if self.mifare_card_dump is None or len(self.mifare_card_dump) < 64:
-                    self.send_response(request, AimeReaderStatus.CARD_ERROR, b"")
-                    return
-
-                self.send_response(
-                    request,
-                    AimeReaderStatus.OK,
-                    self.mifare_card_dump[16 * block_no : 16 * (block_no + 1)],
-                )
-                return
-
-            logger.warning(
-                "unhandled mifare command",
-                command=request.command,
-                payload=request.payload,
-            )
-            self.send_response(request, AimeReaderStatus.INVALID_COMMAND, b"")
-
-            return
-
-        # set reader LED, does not need a response
-        if is_led_request(request):
-            logger.debug(
-                "set LED",
-                command=AimeReaderCommand(request.command),
-                r=request.payload.r,
-                g=request.payload.g,
-                b=request.payload.b,
-            )
-            return
-
-        if is_felica_request(request):
-            if self.aic_card is None:
-                logger.error("received felica request, but no AIC cards exist")
-                self.send_response(request, AimeReaderStatus.INTERNAL_ERROR, b"")
-                return
-
-            packet = request.payload.packet
-            response_payload = {"command": packet.command + 1, "payload": {}}
-
-            if packet.command == FelicaCommand.POLL:
-                logger.debug("felica poll", payload=packet.payload)
-
-                payload = cast(FelicaPollRequestPayload, packet.payload)
-                idm_pmm = self.aic_card.read_block(0x83)
-                response_payload["payload"] = {
-                    "idm": idm_pmm[0:8],
-                    "pmm": idm_pmm[8:16],
-                }
-
-                if payload.request_code == 0x01:
-                    response_payload["payload"]["system_code"] = 0x88B4
-            elif packet.command == FelicaCommand.READ_WITHOUT_ENCRYPTION:
-                logger.debug("felica read without encryption", payload=packet.payload)
-
-                payload = cast(
-                    FelicaReadWithoutEncryptionRequestPayload, packet.payload
-                )
-                idm_pmm = self.aic_card.read_block(0x83)
-                response_payload["payload"] = {
-                    "idm": idm_pmm[0:8],
-                    "status_flag_1": 0,
-                    "status_flag_2": 0,
-                    "block_count": payload.read_block_count,
-                    "blocks": self.aic_card.read_blocks(
-                        [x & 0xFF for x in payload.read_blocks]
-                    ),
-                }
-            elif packet.command == FelicaCommand.WRITE_WITHOUT_ENCRYPTION:
-                logger.debug("felica write without encryption", payload=packet.payload)
-
-                payload = cast(
-                    FelicaWriteWithoutEncryptionRequestPayload, packet.payload
-                )
-                idm_pmm = self.aic_card.read_block(0x83)
-                response_payload["payload"] = {
-                    "idm": idm_pmm[0:8],
-                    "status_flag_1": 0,
-                    "status_flag_2": 0,
-                }
-
-                for block_num, block_data in zip(
-                    payload.write_blocks, payload.write_block_data
-                ):
-                    self.aic_card.write_block(block_num & 0xFF, block_data)
-            elif packet.command == FelicaCommand.GET_SYSTEM_CODE:
-                logger.debug("felica get system code")
-
-                idm_pmm = self.aic_card.read_block(0x83)
-                sys_c = self.aic_card.read_block(0x85)
-                response_payload["payload"] = {
-                    "idm": idm_pmm[0:8],
-                    "system_code_count": 1,
-                    "system_codes": [int.from_bytes(sys_c[0:2], "big")],
-                }
-            elif packet.command == FelicaCommand.ACTIVE:
-                logger.debug("felica active", payload=packet.payload)
-
-                payload = cast(FelicaActiveRequestPayload, packet.payload)
-                idm_pmm = self.aic_card.read_block(0x83)
-                response_payload["payload"] = {
-                    "idm": idm_pmm[0:8],
-                    "value": 0,
-                }
-
-                if payload.value == 0:  # Alive check
-                    response_payload["payload"]["value"] = 0
-                elif payload.value == 1:  # OS version
-                    response_payload["payload"]["value"] = 0
-                elif payload.value == 2:  # something
-                    response_payload["payload"]["value"] = 0xFF
-
-            self.send_response(request, AimeReaderStatus.OK, response_payload)
-            return
-
-        if request.command == AimeReaderCommand.TO_NORMAL_MODE:
-            logger.debug("to normal mode")
-            self.send_response(request, AimeReaderStatus.INVALID_COMMAND, b"")
-            return
-
-        if request.command == AimeReaderCommand.GET_FW_VERSION:
-            logger.debug("get firmware version")
-            self.send_response(request, AimeReaderStatus.OK, self.fw_version)
-            return
-
-        if request.command == AimeReaderCommand.GET_HW_VERSION:
-            logger.debug("get hardware version")
-            self.send_response(request, AimeReaderStatus.OK, self.hw_version)
-            return
-
-        if request.command == AimeReaderCommand.START_POLLING:
-            logger.debug("start polling")
-            self._is_polling = True
-            self._last_poll_time = time.time()
-            self.send_response(request, AimeReaderStatus.OK, b"")
-            return
-
-        if request.command == AimeReaderCommand.STOP_POLLING:
-            logger.debug("stop polling")
-            self._is_polling = False
-            self.send_response(request, AimeReaderStatus.OK, b"")
-            return
-
-        # return the UID of the detected card using the CardInfo struct
-        # if there are no cards, return 0
-        if request.command == AimeReaderCommand.CARD_DETECT:
-            logger.debug("card detect")
-
-            if time.time() > self.card_valid_until:
-                self.mifare_card_dump = None
-                self.aic_card = None
-
-            cards: list[CardDetectInfo] = []
-
-            if self.mifare_card_dump is not None:
-                cards.append(
-                    {
-                        "type": CardType.MIFARE.value,
-                        "id": self.mifare_card_dump[:4],
-                    }
-                )
-            elif self.aic_card is not None:
-                cards.append(
-                    {
-                        "type": CardType.FELICA.value,
-                        "id": self.aic_card.read_block(0x83),
-                    }
-                )
-
-            self.send_response(
-                request,
-                AimeReaderStatus.OK,
-                {"count": len(cards), "cards": cards},
-            )
-            return
-
-        if request.command in (
-            AimeReaderCommand.CARD_SELECT,
-            AimeReaderCommand.CARD_HALT,
-        ):
-            logger.debug("card select/halt", command=AimeReaderCommand(request.command))
-            self.send_response(request, AimeReaderStatus.OK, b"")
-            return
-
-        if request.command == AimeReaderCommand.MIFARE_KEY_SET_A:
-            logger.debug("mifare set keyA", payload=request.payload.hex())
-            self._mifare_key_a = request.payload[:6]
-            self.send_response(request, AimeReaderStatus.OK, b"")
-            return
-
-        if request.command == AimeReaderCommand.MIFARE_KEY_SET_B:
-            logger.debug("mifare set keyB", payload=request.payload.hex())
-            self._mifare_key_b = request.payload[:6]
-            self.send_response(request, AimeReaderStatus.OK, b"")
-            return
-
-        if request.command == AimeReaderCommand.EXT_BOARD_INFO:
-            logger.debug("get LED info")
-            self.send_response(request, AimeReaderStatus.OK, self.led_info)
-            return
-
-        if request.command in (
-            AimeReaderCommand.TO_UPDATER_MODE,
-            AimeReaderCommand.EXT_TO_NORMAL_MODE,
-            AimeReaderCommand.SEND_BINDATA_INIT,
-        ):
-            logger.debug(
-                "updater mode stuff", command=AimeReaderCommand(request.command)
-            )
-            self.send_response(request, AimeReaderStatus.OK, b"")
-            return
-
-        if request.command == AimeReaderCommand.SEND_BINDATA_EXEC:
-            logger.debug("sending update data", payload_length=len(request.payload))
-            self.send_response(request, AimeReaderStatus.FIRM_UPDATE_SUCCESS, b"")
-            return
-
-        if request.command == AimeReaderCommand.SEND_HEX_DATA:
-            logger.debug("sending hex data", payload_length=len(request.payload))
-            self.send_response(request, AimeReaderStatus.COMP_DUMMY_3RD, b"")
-            return
-
-        try:
-            logger.warning(
-                "unimplemented command",
-                command=AimeReaderCommand(request.command),
-                payload=request.payload.hex(),
-            )
-        except ValueError:
-            logger.warning(
-                "unknown command",
-                command=request.command,
-                payload=request.payload.hex(),
-            )
-
-        self.send_response(request, AimeReaderStatus.INVALID_COMMAND, b"")
-
-    def send_response(
-        self,
-        request: AimeReaderRequest[Any],  # pyright: ignore[reportExplicitAny]
-        status: AimeReaderStatus,
-        payload: bytes | CardDetectResponsePayload | dict[str, Any],  # pyright: ignore[reportExplicitAny]
-    ):
-        response: AimeReaderResponseDict = {
-            "address": request.address,
-            "sequence": request.sequence,
-            "command": request.command,
-            "status": status.value,
-            "payload": payload,
-        }
-
-        logger.debug(
-            "sending response",
-            status=status,
-            payload=payload.hex() if isinstance(payload, bytes) else payload,
-        )
-
-        data = AimeReaderResponseFormat.build(cast(dict[str, Any], response))  # pyright: ignore[reportInvalidCast, reportExplicitAny]
-
-        logger.debug(
-            "raw data",
-            data=data.hex(),
-        )
-
-        escaped_data = bytearray([0xE0])
-        checksum = 0
-
-        for c in data:
-            if c in (0xE0, 0xD0):
-                escaped_data.append(0xD0)
-                escaped_data.append(c - 1)
-            else:
-                escaped_data.append(c)
-
-            checksum = (c + checksum) % 256
-
-        escaped_data.append(checksum)
-        _ = self._serial.write(escaped_data)
+        if outgoing_data:
+            # logger.debug("outgoing data", data=outgoing_data.hex())
+            _ = self._serial.write(outgoing_data)
 
 
 async def amnet_info(request: Request):
     started_at = cast(float, request.app.state.started_at)
-    reader = cast(AimeReader, request.app.state.reader)
+    manager = cast(AimeReaderManager, request.app.state.manager)
 
     return JSONResponse(
         {
             "apiVersion": 1,
             "gameId": "SBSD",
             "serverName": "amnet-aime-reader",
-            "sessionUptime": int((time.time() - started_at) * 1000),
-            "timeSinceLastPoll": int((time.time() - reader.last_poll_time) * 1000),
+            "sessionUptime": int((time.monotonic() - started_at) * 1000),
+            "timeSinceLastPoll": int(
+                (time.monotonic() - manager.reader.last_poll_time) * 1000
+            ),
         }
     )
 
 
 async def amnet_signin(request: Request):
-    reader = cast(AimeReader, request.app.state.reader)
+    manager = cast(AimeReaderManager, request.app.state.manager)
     current_time = time.time()
 
-    if reader.card_valid_until > current_time:
+    if manager.reader.card_valid_until > current_time:
         return JSONResponse(
             {"message": "Too many requests."},
             status_code=HTTP_429_TOO_MANY_REQUESTS,
-            headers={"Retry-After": f"{int(reader.card_valid_until - current_time)}"},
+            headers={
+                "Retry-After": f"{int(manager.reader.card_valid_until - current_time)}"
+            },
         )
 
     data = await request.json()
@@ -892,7 +1050,7 @@ async def amnet_signin(request: Request):
             status_code=HTTP_400_BAD_REQUEST,
         )
 
-    if (physical_card_idm := data.get("physicalCardIDm")) is not None:  # pyright: ignore[reportUnknownMemberType]
+    if (physical_card_idm := data.get("physicalCardIDm")) is not None:  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
         if not isinstance(physical_card_idm, str):
             return JSONResponse(
                 {"message": "Bad Request"}, status_code=HTTP_400_BAD_REQUEST
@@ -911,20 +1069,18 @@ async def amnet_signin(request: Request):
                 status_code=HTTP_400_BAD_REQUEST,
             )
 
-        reader.set_aic_card(
-            AICCard(bytes.fromhex(physical_card_idm), bytes.fromhex(access_code))
+        manager.reader.aic_card = AICCard(
+            bytes.fromhex(physical_card_idm), bytes.fromhex(access_code)
         )
     else:
-        reader.set_mifare_card(
-            bytes.fromhex(
-                (
-                    "0102030426880400C819002000000018"
-                    # HACK: the serial at the end of block1 should be replaced with the serial from the actual AC
-                    # but it seems to card in so...
-                    "5342534400000000000000000050665B"
-                    f"000000000000{access_code}"
-                    "57434346763270F87811574343467632"
-                )
+        manager.reader.mifare_card = bytes.fromhex(
+            (
+                "0102030426880400C819002000000018"
+                # HACK: the serial at the end of block1 should be replaced with the serial from the actual AC
+                # but it seems to card in so...
+                "5342534400000000000000000050665B"
+                f"000000000000{access_code}"
+                "57434346763270F87811574343467632"
             )
         )
 
@@ -932,14 +1088,16 @@ async def amnet_signin(request: Request):
 
 
 async def signin(request: Request):
-    reader = cast(AimeReader, request.app.state.reader)
-    current_time = time.time()
+    manager = cast(AimeReaderManager, request.app.state.manager)
+    current_time = time.monotonic()
 
-    if reader.card_valid_until > current_time:
+    if manager.reader.card_valid_until > current_time:
         return JSONResponse(
             {"message": "Too many requests."},
             status_code=HTTP_429_TOO_MANY_REQUESTS,
-            headers={"Retry-After": f"{int(reader.card_valid_until - current_time)}"},
+            headers={
+                "Retry-After": f"{int(manager.reader.card_valid_until - current_time)}"
+            },
         )
 
     content_type = request.headers.get("content-type")
@@ -957,7 +1115,7 @@ async def signin(request: Request):
             status_code=HTTP_400_BAD_REQUEST,
         )
 
-    reader.set_mifare_card(data)
+    manager.reader.mifare_card = data
 
     return Response(status_code=HTTP_202_ACCEPTED)
 
@@ -974,14 +1132,14 @@ app = Starlette(debug=False, routes=routes, middleware=middleware)
 
 
 def main():
-    reader = AimeReader("COM31", 2)
+    manager = AimeReaderManager("COM31", 2)
 
-    _ = signal.signal(signal.SIGTERM, lambda s, f: reader.close())
-    _ = signal.signal(signal.SIGINT, lambda s, f: reader.close())
-    threading.Thread(target=reader.start).start()
+    _ = signal.signal(signal.SIGTERM, lambda s, f: manager.close())
+    _ = signal.signal(signal.SIGINT, lambda s, f: manager.close())
+    threading.Thread(target=manager.start).start()
 
-    app.state.started_at = time.time()
-    app.state.reader = reader
+    app.state.started_at = time.monotonic()
+    app.state.manager = manager
 
     uvicorn.run(app)
 
